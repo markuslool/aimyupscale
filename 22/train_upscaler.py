@@ -37,10 +37,10 @@ USE_AMP         = True
 VAL_EVERY       = 5
 
 EMA_DECAY       = 0.999
-PIXEL_WEIGHT    = 0.40
-TEACHER_WEIGHT  = 0.30
-GRAD_WEIGHT     = 0.15
-HF_WEIGHT       = 0.15
+PIXEL_WEIGHT    = 0.55
+TEACHER_WEIGHT  = 0.05
+GRAD_WEIGHT     = 0.20
+HF_WEIGHT       = 0.20
 
 # Disabled for the stable baseline. Hard mining can distort the training
 # distribution and is intentionally NOT used in this version.
@@ -430,7 +430,7 @@ def train():
 
     print("\n--- Training student ---")
     print(
-        "Loss = 0.40*pixel + 0.15*gradient + 0.15*high-frequency + 0.30*teacher residual (detail-weighted)"
+        "Loss = 0.55*pixel + 0.20*gradient + 0.20*high-frequency + 0.05*teacher residual"
     )
     print("Hard mining: DISABLED (uniform sampling for stable training)")
 
@@ -484,17 +484,10 @@ def train():
                     high_frequency(hr),
                 )
 
-                # Distill the teacher's actual added detail over bicubic.
-                # Smooth regions stay cheap; high-frequency teacher residuals
-                # receive more weight so the 448-MAC student spends capacity
-                # where it matters visually.
-                teacher_hf = high_frequency(teacher_residual)
-                hf_strength = teacher_hf.abs().mean(dim=1, keepdim=True)
-                hf_weight = 1.0 + 3.0 * torch.clamp(hf_strength / 0.05, 0.0, 1.0)
-                teacher_err = torch.sqrt(
-                    (residual - teacher_residual) ** 2 + 1e-3 ** 2
+                loss_teacher = charbonnier(
+                    residual,
+                    teacher_residual,
                 )
-                loss_teacher = (teacher_err * hf_weight).mean()
 
                 loss = (
                     PIXEL_WEIGHT * loss_pixel
