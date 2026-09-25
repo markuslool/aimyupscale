@@ -5,24 +5,30 @@ import multiprocessing
 from PIL import Image
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ
 # ==========================================
 DIV2K_DIR       = "./DIV2K_train_HR"
-VALID_DIR       = "./DIV2K_valid_HR"       # опционально; если нет — возьмём часть train
+VALID_DIR       = "./DIV2K_valid_HR"
+CACHE_FILE      = "./div2k_cache_x2_64.pt"     # один файл со всем кэшем
+CACHE_LR_SIZE   = 32                           # LR-патч (HR = 64 при x2)
+
 SCALE_FACTOR    = 2
-PATCH_SIZE      = 128                      # HR-патч; LR = 64
-BATCH_SIZE      = 64
+PATCH_SIZE      = 64                           # HR-патч (было 128)
+BATCH_SIZE      = 128
 EPOCHS          = 50
-NUM_WORKERS     = 4
+NUM_WORKERS     = 2                            # Colab: 2 vCPU
+PREFETCH        = 4
 LEARNING_RATE   = 1e-3
 USE_AMP         = True
-PATCHES_PER_IMG = 3                        # виртуальная длина эпохи
+PATCHES_PER_IMG = 3                           # было 3 эпохи
 VAL_EVERY       = 5
+EMA_START_EPOCH = 15                           # валидировать EMA не раньше
 CHKPT_DIR       = "./checkpoints"
 
 if torch.cuda.is_available():
@@ -38,73 +44,129 @@ else:
 os.makedirs(CHKPT_DIR, exist_ok=True)
 
 # ==========================================
-# 2. ДАТАСЕТ
+# 2. ПРЕПРОЦЕССИНГ: один раз режем DIV2K на патчи и кэшируем в RAM
 # ==========================================
-class DIV2KDataset(Dataset):
-    def __init__(self, img_dir, patch_size=128, scale=2, patches_per_img=3, augment=True):
-        self.patch_size = patch_size
-        self.scale = scale
-        self.patches_per_img = patches_per_img
-        self.augment = augment
+def build_cache_if_needed():
+    """
+    Один раз проходит по DIV2K, режет каждую картинку на патчи 64x64 (HR) / 32x32 (LR),
+    сохраняет в один .pt файл как uint8-тензоры (экономия RAM в 4 раза).
+    Патчи сохраняются БЕЗ аугментаций — аугментации делаются на лету на GPU.
+    """
+    if os.path.exists(CACHE_FILE):
+        print(f"Кэш найден: {CACHE_FILE}")
+        return
 
-        self.img_paths = []
-        for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
-            self.img_paths += glob.glob(os.path.join(img_dir, "**", ext), recursive=True)
-            self.img_paths += glob.glob(os.path.join(img_dir, "**", ext.upper()), recursive=True)
-        self.img_paths = sorted(set(self.img_paths))
+    print(f"Строю кэш из {DIV2K_DIR} ... (один раз, может занять пару минут)")
 
-        if not self.img_paths:
-            raise ValueError(f"Не найдены картинки в {img_dir}!")
+    # Собираем все пути
+    img_paths = []
+    for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"):
+        img_paths += glob.glob(os.path.join(DIV2K_DIR, "**", ext), recursive=True)
+        img_paths += glob.glob(os.path.join(DIV2K_DIR, "**", ext.upper()), recursive=True)
+    img_paths = sorted(set(img_paths))
+    if not img_paths:
+        raise ValueError(f"Не найдены картинки в {DIV2K_DIR}!")
 
-        print(f"Найдено картинок: {len(self.img_paths)}")
-        self.to_tensor = T.ToTensor()
+    print(f"Найдено картинок: {len(img_paths)}")
 
-    def __len__(self):
-        return len(self.img_paths) * self.patches_per_img
+    hr_patches = []
+    lr_patches = []
+    stride = PATCH_SIZE  # без перекрытия — самый быстрый вариант
+    to_tensor = T.ToTensor()
 
-    def __getitem__(self, idx):
-        img_idx = idx // self.patches_per_img
-
-        for _ in range(5):
-            img_path = self.img_paths[img_idx]
-            try:
-                img = Image.open(img_path).convert("RGB")
-                break
-            except Exception:
-                img_idx = random.randrange(len(self.img_paths))
-        else:
-            raise RuntimeError("Не удалось открыть картинку за 5 попыток")
+    for i, path in enumerate(img_paths):
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            print(f"  пропуск {path}: {e}")
+            continue
 
         w, h = img.size
-        if w < self.patch_size or h < self.patch_size:
-            img = img.resize((max(w, self.patch_size), max(h, self.patch_size)))
-            w, h = img.size
+        if w < PATCH_SIZE or h < PATCH_SIZE:
+            continue
 
-        x = random.randint(0, w - self.patch_size)
-        y = random.randint(0, h - self.patch_size)
-        hr_patch = img.crop((x, y, x + self.patch_size, y + self.patch_size))
+        # Режем на патчи с шагом stride
+        for y in range(0, h - PATCH_SIZE + 1, stride):
+            for x in range(0, w - PATCH_SIZE + 1, stride):
+                hr = img.crop((x, y, x + PATCH_SIZE, y + PATCH_SIZE))
+                lr = hr.resize((CACHE_LR_SIZE, CACHE_LR_SIZE), Image.BICUBIC)
 
-        if self.augment:
-            if random.random() > 0.5:
-                hr_patch = hr_patch.transpose(Image.FLIP_LEFT_RIGHT)
-            if random.random() > 0.5:
-                hr_patch = hr_patch.transpose(Image.FLIP_TOP_BOTTOM)
-            k = random.randint(0, 3)
-            if k:
-                hr_patch = hr_patch.rotate(90 * k, expand=True)
+                hr_t = (to_tensor(hr) * 255.0).round().byte()  # uint8
+                lr_t = (to_tensor(lr) * 255.0).round().byte()
 
-        lr_size = self.patch_size // self.scale
-        lr_patch = hr_patch.resize((lr_size, lr_size), Image.BICUBIC)
+                hr_patches.append(hr_t)
+                lr_patches.append(lr_t)
 
-        return self.to_tensor(lr_patch), self.to_tensor(hr_patch)
+        if (i + 1) % 100 == 0:
+            print(f"  обработано {i+1}/{len(img_paths)}, патчей: {len(hr_patches)}")
+
+    print(f"Всего патчей: {len(hr_patches)}. Сохраняю в {CACHE_FILE} ...")
+    torch.save({
+        'lr': torch.stack(lr_patches),   # [N, 3, 32, 32] uint8
+        'hr': torch.stack(hr_patches),   # [N, 3, 64, 64] uint8
+    }, CACHE_FILE)
+    print(f"Кэш сохранён. Размер LR: {lr_patches[0].shape}, HR: {hr_patches[0].shape}")
+
 
 # ==========================================
-# 3. АРХИТЕКТУРА (совпадает с HLSL)
+# 3. ДАТАСЕТ ИЗ КЭША (всё в RAM, аугментации на GPU)
+# ==========================================
+class CachedPatchDataset(Dataset):
+    """
+    Загружает весь кэш в RAM как uint8. На __getitem__ возвращает пару (lr, hr)
+    в float32 [0,1] БЕЗ аугментаций — аугментации делаются в train-цикле на GPU.
+    """
+    def __init__(self, cache_file, augment=False):
+        data = torch.load(cache_file, map_location='cpu')
+        self.lr = data['lr']    # [N, 3, 32, 32] uint8
+        self.hr = data['hr']    # [N, 3, 64, 64] uint8
+        self.augment = augment
+        self.n = self.lr.shape[0]
+        print(f"CachedPatchDataset: {self.n} пар, LR {tuple(self.lr.shape[1:])}, HR {tuple(self.hr.shape[1:])}")
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        # uint8 -> float32 [0,1]
+        lr = self.lr[idx].float().div_(255.0)
+        hr = self.hr[idx].float().div_(255.0)
+        return lr, hr
+
+
+def augment_batch(lr, hr):
+    """
+    Аугментации на GPU-тензорах. Применяются ОДИНАКОВО к lr и hr
+    (flip/rot180 — они коммутируют с downscale).
+    """
+    B = lr.size(0)
+    # horizontal flip
+    mask_h = torch.rand(B, device=lr.device) > 0.5
+    if mask_h.any():
+        lr[mask_h] = torch.flip(lr[mask_h], dims=[3])
+        hr[mask_h] = torch.flip(hr[mask_h], dims=[3])
+    # vertical flip
+    mask_v = torch.rand(B, device=lr.device) > 0.5
+    if mask_v.any():
+        lr[mask_v] = torch.flip(lr[mask_v], dims=[2])
+        hr[mask_v] = torch.flip(hr[mask_v], dims=[2])
+    # rot90 x k (только кратные 90, чтобы LR/HR оставались согласованы)
+    k = torch.randint(0, 4, (B,), device=lr.device)
+    for kk in range(1, 4):
+        mask_k = (k == kk)
+        if mask_k.any():
+            lr[mask_k] = torch.rot90(lr[mask_k], k=kk, dims=[2, 3])
+            hr[mask_k] = torch.rot90(hr[mask_k], k=kk, dims=[2, 3])
+    return lr, hr
+
+
+# ==========================================
+# 4. АРХИТЕКТУРА (совпадает с HLSL)
 # ==========================================
 class MiniESPCN(nn.Module):
     """
     Conv3x3(3->32)+ReLU -> Conv5x5(32->16)+ReLU -> Conv3x3(16->12) -> PixelShuffle(2x)
-    Receptive field всей сети: 9x9 (1+2+1 с каждой стороны).
+    Receptive field всей сети: 9x9.
     Параметров: ~13K.
     """
     def __init__(self, scale_factor=2):
@@ -112,10 +174,8 @@ class MiniESPCN(nn.Module):
         assert scale_factor == 2, "HLSL-шейдер написан под x2"
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.relu1 = nn.ReLU(inplace=True)
-
         self.conv2 = nn.Conv2d(32, 16, kernel_size=5, padding=2)
         self.relu2 = nn.ReLU(inplace=True)
-
         self.conv3 = nn.Conv2d(16, 3 * (scale_factor ** 2), kernel_size=3, padding=1)
         self.pixel_shuffle = nn.PixelShuffle(scale_factor)
 
@@ -125,14 +185,16 @@ class MiniESPCN(nn.Module):
         x = self.pixel_shuffle(self.conv3(x))
         return x
 
+
 # ==========================================
-# 4. LOSS
+# 5. LOSS
 # ==========================================
 def charbonnier_loss(pred, target, eps=1e-3):
     return torch.mean(torch.sqrt((pred - target) ** 2 + eps ** 2))
 
+
 # ==========================================
-# 5. ВАЛИДАЦИЯ
+# 6. ВАЛИДАЦИЯ
 # ==========================================
 @torch.no_grad()
 def validate(model, val_loader):
@@ -149,34 +211,31 @@ def validate(model, val_loader):
     model.train()
     return total_psnr / max(n, 1)
 
+
 # ==========================================
-# 6. ОБУЧЕНИЕ
+# 7. ОБУЧЕНИЕ
 # ==========================================
 def train():
-    dataset = DIV2KDataset(DIV2K_DIR, patch_size=PATCH_SIZE, scale=SCALE_FACTOR,
-                           patches_per_img=PATCHES_PER_IMG, augment=True)
+    build_cache_if_needed()
 
-    if os.path.isdir(VALID_DIR) and glob.glob(os.path.join(VALID_DIR, "**", "*.png"), recursive=True):
-        val_set = DIV2KDataset(VALID_DIR, patch_size=PATCH_SIZE, scale=SCALE_FACTOR,
-                               patches_per_img=1, augment=False)
-    else:
-        n_val = min(20, len(dataset.img_paths))
-        val_set = Subset(
-            DIV2KDataset(DIV2K_DIR, patch_size=PATCH_SIZE, scale=SCALE_FACTOR,
-                         patches_per_img=1, augment=False),
-            indices=list(range(n_val)),
-        )
+    dataset = CachedPatchDataset(CACHE_FILE, augment=False)
+
+    # Валидация — 100 случайных патчей из того же кэша (быстро и без I/O)
+    n_val = min(100, len(dataset))
+    val_idx = list(range(n_val))
+    val_subset = torch.utils.data.Subset(dataset, val_idx)
 
     dataloader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=NUM_WORKERS if device.type == 'cuda' else 0,
         pin_memory=(device.type == 'cuda'),
-        persistent_workers=(NUM_WORKERS > 0 and device.type == 'cuda'),
+        persistent_workers=(device.type == 'cuda' and NUM_WORKERS > 0),
+        prefetch_factor=PREFETCH if NUM_WORKERS > 0 else None,
         drop_last=True,
     )
     val_loader = DataLoader(
-        val_set, batch_size=8, shuffle=False,
-        num_workers=2 if device.type == 'cuda' else 0,
+        val_subset, batch_size=32, shuffle=False,
+        num_workers=0 if device.type != 'cuda' else NUM_WORKERS,
         pin_memory=(device.type == 'cuda'),
     )
 
@@ -186,7 +245,10 @@ def train():
 
     criterion = charbonnier_loss
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+    # eta_min=1e-4 вместо 1e-5 — LR не падает в ноль
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS, eta_min=1e-4
+    )
 
     # EMA модель
     ema_model = MiniESPCN(scale_factor=SCALE_FACTOR).to(device)
@@ -199,16 +261,22 @@ def train():
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     print(f"\n--- Обучение на {device} ---")
-    print(f"AMP: {'вкл' if use_amp else 'выкл'} | Loss: Charbonnier | LR: {LEARNING_RATE} -> 1e-5 (Cosine)")
+    print(f"AMP: {'вкл' if use_amp else 'выкл'} | Loss: Charbonnier | LR: {LEARNING_RATE} -> 1e-4 (Cosine)")
+    print(f"Патчей в датасете: {len(dataset)} | Батчей на эпоху: {len(dataloader)}")
+    print(f"Всего шагов за {EPOCHS} эпох: {len(dataloader) * EPOCHS}")
     model.train()
 
     best_psnr = -1.0
+    global_step = 0
 
     for epoch in range(1, EPOCHS + 1):
         running_loss = 0.0
         for lr, hr in dataloader:
             lr = lr.to(device, non_blocking=True)
             hr = hr.to(device, non_blocking=True)
+
+            # Аугментации на GPU
+            lr, hr = augment_batch(lr, hr)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=use_amp):
@@ -219,9 +287,12 @@ def train():
             scaler.step(optimizer)
             scaler.update()
 
+            # EMA с warm-up: на первых шагах быстро тянется к модели
+            global_step += 1
+            d = min(ema_decay, (1 + global_step) / (10 + global_step))
             with torch.no_grad():
                 for pe, pm in zip(ema_model.parameters(), model.parameters()):
-                    pe.mul_(ema_decay).add_(pm.detach(), alpha=1 - ema_decay)
+                    pe.mul_(d).add_(pm.detach(), alpha=1 - d)
                 for be, bm in zip(ema_model.buffers(), model.buffers()):
                     be.copy_(bm)
 
@@ -230,12 +301,16 @@ def train():
         scheduler.step()
         epoch_loss = running_loss / len(dataloader)
         cur_lr = optimizer.param_groups[0]['lr']
-        print(f"Эпоха [{epoch}/{EPOCHS}] - Loss: {epoch_loss:.5f} | LR: {cur_lr:.2e}")
+        print(f"Эпоха [{epoch}/{EPOCHS}] - Loss: {epoch_loss:.5f} | LR: {cur_lr:.2e} | step: {global_step}")
 
         if epoch % VAL_EVERY == 0 or epoch == EPOCHS:
             psnr_raw = validate(model, val_loader)
-            psnr_ema = validate(ema_model, val_loader)
-            print(f"   -> PSNR raw: {psnr_raw:.3f} dB | EMA: {psnr_ema:.3f} dB")
+            print(f"   -> PSNR raw: {psnr_raw:.3f} dB")
+
+            psnr_ema = None
+            if epoch >= EMA_START_EPOCH:
+                psnr_ema = validate(ema_model, val_loader)
+                print(f"   -> PSNR EMA: {psnr_ema:.3f} dB")
 
             ckpt = {
                 'epoch': epoch,
@@ -246,20 +321,26 @@ def train():
                 'loss': epoch_loss,
                 'psnr_raw': psnr_raw,
                 'psnr_ema': psnr_ema,
+                'global_step': global_step,
             }
             torch.save(ckpt, os.path.join(CHKPT_DIR, f"ckpt_ep{epoch:03d}.pth"))
 
-            if psnr_ema > best_psnr:
-                best_psnr = psnr_ema
-                torch.save({'model': ema_model.state_dict(), 'psnr': psnr_ema},
+            # best по raw, если EMA ещё не валидируется
+            score = psnr_ema if psnr_ema is not None else psnr_raw
+            if score > best_psnr:
+                best_psnr = score
+                torch.save({'model': ema_model.state_dict() if psnr_ema is not None
+                            else model.state_dict(),
+                            'psnr': score},
                            os.path.join(CHKPT_DIR, "best.pth"))
-                print(f"   -> Новый лучший PSNR (EMA): {best_psnr:.3f} dB")
+                print(f"   -> Новый лучший PSNR: {best_psnr:.3f} dB")
 
     print("Обучение завершено!")
     return ema_model
 
+
 # ==========================================
-# 7. ЭКСПОРТ ВЕСОВ В HLSL
+# 8. ЭКСПОРТ ВЕСОВ В HLSL
 # ==========================================
 def export_to_hlsl(model, filename="weights.hlsl"):
     print(f"Экспорт весов в {filename}...")
@@ -292,8 +373,9 @@ def export_to_hlsl(model, filename="weights.hlsl"):
 
     print("weights.hlsl готов.")
 
+
 # ==========================================
-# 8. ГЕНЕРАЦИЯ HLSL COMPUTE SHADER
+# 9. ГЕНЕРАЦИЯ HLSL COMPUTE SHADER
 # ==========================================
 def generate_hlsl_shader(filename="upscale_cs.hlsl"):
     print(f"Генерация {filename}...")
@@ -306,21 +388,14 @@ def generate_hlsl_shader(filename="upscale_cs.hlsl"):
 //   halo = 4 (radius всей сети)
 //   IN = 16x16 LR-входов
 //
-// Dependency cone (с уменьшением размеров слоёв):
-//   input  16x16
-//   conv1  14x14  (radius 1)   -> храним в shared
-//   conv2  10x10  (radius 2)   -> храним в shared
-//   conv3   8x8   (radius 1)   -> в регистрах
-//
 // Shared memory:
 //   s_input: 16x16x3  = 3.0 KB
 //   s_l1:    14x14x32 = 25.1 KB
 //   s_l2:    10x10x16 = 6.4 KB
-//   итого:   ~34.5 KB  (влезает в 48 KB Kepler)
+//   итого:   ~34.5 KB
 //
 // Dispatch: Dispatch(ceil(W_LR/8), ceil(H_LR/8), 1)
 
-// Compute Shader 2x Upscaler (MiniESPCN) — corrected
 #include "weights.hlsl"
 
 Texture2D<float4>   InputTexture  : register(t0);
@@ -351,7 +426,7 @@ void CSMain(uint3 gid  : SV_GroupID,
 
     int2 inBase = int2(gid.xy * uint2(TG_X, TG_Y)) - int2(HALO, HALO);
 
-    // ---------- Загрузка входа с ZERO-padding (как PyTorch padding_mode='zeros') ----------
+    // ---------- Загрузка входа с ZERO-padding ----------
     for (int y = gtid.y; y < IN_H; y += TG_Y) {
         for (int x = gtid.x; x < IN_W; x += TG_X) {
             int2 p = inBase + int2(x, y);
@@ -444,9 +519,7 @@ void CSMain(uint3 gid  : SV_GroupID,
 
     // ---------- PixelShuffle + BOUNDS CHECK ----------
     int2 outPixel = int2(gid.xy * uint2(TG_X, TG_Y)) + int2(gtid.xy);
-    int2 outTexSize = int2(texSize) * 2;
 
-    // Проверка: не вышли ли за пределы выходной текстуры
     if (outPixel.x >= (int)texSize.x || outPixel.y >= (int)texSize.y)
         return;
 
@@ -462,8 +535,9 @@ void CSMain(uint3 gid  : SV_GroupID,
         f.write(hlsl)
     print(f"{filename} готов.")
 
+
 # ==========================================
-# 9. ТОЧКА ВХОДА
+# 10. ТОЧКА ВХОДА
 # ==========================================
 if __name__ == "__main__":
     multiprocessing.freeze_support()
